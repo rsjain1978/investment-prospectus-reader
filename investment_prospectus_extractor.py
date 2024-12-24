@@ -14,8 +14,12 @@ import aiohttp
 from dotenv import load_dotenv
 from extraction_prompt import EXTRACTION_PROMPT
 import traceback
+import uuid
+from colorama import Fore, Style, init
 
-# Load environment variables
+# Initialize colorama
+init()
+
 load_dotenv()
 
 # Configure logging
@@ -28,6 +32,16 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Add colored logging functions
+def log_image(msg: str):
+    logger.info(f"{Fore.GREEN}{msg}{Style.RESET_ALL}")
+
+def log_openai(msg: str):
+    logger.info(f"{Fore.YELLOW}{msg}{Style.RESET_ALL}")
+
+def log_success(msg: str):
+    logger.info(f"{Fore.CYAN}{msg}{Style.RESET_ALL}")
 
 
 class InvestmentProspectusExtractor:
@@ -43,20 +57,30 @@ class InvestmentProspectusExtractor:
         self.max_retries = max_retries
         self.timeout = timeout
         self.dpi = dpi
+        self.run_id = str(uuid.uuid4())
+        
+        # Create base directories
         self.output_dir = Path('extracted_pages')
         self.data_dir = Path('extracted_data')
         self.output_dir.mkdir(exist_ok=True)
         self.data_dir.mkdir(exist_ok=True)
+        
+        # Create run-specific subdirectories
+        self.run_output_dir = self.output_dir / self.run_id
+        self.run_data_dir = self.data_dir / self.run_id
+        self.run_output_dir.mkdir(exist_ok=True)
+        self.run_data_dir.mkdir(exist_ok=True)
+        
         self.extraction_prompt = EXTRACTION_PROMPT
-        self.batch_size = 5  # Set batch size
+        self.batch_size = 5
 
 
     def extract_page_as_image(self, pdf_path: str, page_number: int) -> Optional[Path]:
         """Convert a single PDF page to an image using PyMuPDF."""
         try:
-            output_path = self.output_dir / f"page_{page_number:03d}.png"
+            output_path = self.run_output_dir / f"page_{page_number:03d}.png"
             if output_path.exists():
-                logger.info(f"Page {page_number} already exists. Skipping.")
+                log_image(f"Page {page_number} already exists. Skipping.")
                 return output_path
 
             # Open PDF and render the specific page
@@ -65,7 +89,7 @@ class InvestmentProspectusExtractor:
             pix = page.get_pixmap(dpi=self.dpi)  # Render the page as a pixmap
             image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             image.save(output_path, "PNG", optimize=True)
-            logger.info(f"Page {page_number} saved to {output_path}.")
+            log_image(f"Page {page_number} saved to {output_path}.")
             return output_path
         except Exception as e:
             logger.error(f"Error extracting page {page_number}: {str(e)}")
@@ -173,7 +197,7 @@ class InvestmentProspectusExtractor:
         """Save extracted data for a single page to a JSON file."""
         try:
             page_number = page_data["page_number"]
-            output_path = self.data_dir / f"page_{page_number:03d}.json"
+            output_path = self.run_data_dir / f"page_{page_number:03d}.json"
             
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(page_data, f, indent=2, ensure_ascii=False)
@@ -188,21 +212,28 @@ class InvestmentProspectusExtractor:
         try:
             start_time = datetime.now()
             tasks = []
+            total_pages = end_page - start_page + 1
+            successful_extractions = 0
+            failed_extractions = 0
 
-            # Collect tasks for each page
+            # Extract all images first with progress tracking
+            log_image(f"Starting image extraction for pages {start_page} to {end_page}...")
             for page_number in range(start_page, end_page + 1):
                 image_path = self.extract_page_as_image(pdf_path, page_number)
-
-                # Skip pages that failed to extract
                 if image_path:
-                    task = self.extract_information(image_path, page_number)
-                    tasks.append(task)
+                    tasks.append(self.extract_information(image_path, page_number))
+                    successful_extractions += 1
+                else:
+                    failed_extractions += 1
 
             # Process tasks in batches
             results = []
+            total_batches = len(tasks) // self.batch_size + (1 if len(tasks) % self.batch_size else 0)
+            
             for i in range(0, len(tasks), self.batch_size):
                 batch = tasks[i:i + self.batch_size]
-                logger.info(f"Processing batch {i // self.batch_size + 1} with {len(batch)} tasks.")
+                current_batch = i // self.batch_size + 1
+                log_openai(f"Processing batch {current_batch}/{total_batches} ({len(batch)} pages)")
                 batch_results = await asyncio.gather(*batch)
                 
                 # Save each page's data immediately after processing
@@ -211,34 +242,42 @@ class InvestmentProspectusExtractor:
                         self.save_page_data(page_data)
                 
                 results.extend(batch_results)
-
-                # Optional: Add a short delay between batches to avoid throttling
                 await asyncio.sleep(1)
 
-            # Calculate summary statistics
+            # Calculate final statistics
             successful = [r for r in results if r["status"] == "success"]
             failed = [r for r in results if r["status"] == "error"]
+            processing_time = datetime.now() - start_time
             
             summary = {
                 "metadata": {
+                    "run_id": self.run_id,
                     "pdf_path": pdf_path,
                     "start_page": start_page,
                     "end_page": end_page,
                     "total_pages_processed": len(results),
                     "successful_extractions": len(successful),
                     "failed_extractions": len(failed),
-                    "processing_time": str(datetime.now() - start_time)
+                    "processing_time": str(processing_time)
                 },
-                "results_location": str(self.data_dir)
+                "results_location": str(self.run_data_dir)
             }
             
-            # Save summary to a separate file
-            summary_path = self.data_dir / "extraction_summary.json"
+            # Save summary to run-specific directory
+            summary_path = self.run_data_dir / "extraction_summary.json"
             with open(summary_path, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
             
-            logger.info(f"Processed {len(results)} pages in {len(results) // self.batch_size + 1} batches.")
-            logger.info(f"Results saved in {self.data_dir}")
+            # Single comprehensive log statement at the end
+            log_success(
+                f"\nExtraction completed for run {self.run_id}:\n"
+                f"- Pages processed: {start_page} to {end_page} ({total_pages} total)\n"
+                f"- Images extracted: {successful_extractions} successful, {failed_extractions} failed\n"
+                f"- Text extraction: {len(successful)} successful, {len(failed)} failed\n"
+                f"- Processing time: {processing_time}\n"
+                f"- Results saved in: {self.run_data_dir}"
+            )
+            
             return summary
             
         except Exception as e:
